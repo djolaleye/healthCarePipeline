@@ -23,12 +23,6 @@ def parse_iso(iso: str) -> datetime:
     
     return dt.astimezone(timezone.utc)
 
-def _print_glue_columns(table: str, columns: tuple[tuple[str, str], ...]) -> None:
-    print(f"# {table}")
-
-    for name, typ in columns:
-        print(f"- Name: {name}\n  Type: {typ}")
- 
 
 # Partitioning
 ZONE_CLEAN = "clean"
