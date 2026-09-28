@@ -1,0 +1,344 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Real-time synthetic patient vitals ingestion and pseudonymization pipeline
+  Kinesis ->  Lambda transform -> S3 (Clean / Quarantine) -> Glue -> Athena
+    Failures -> SQS DLQ (shard + sequence metadata)
+  Kinesis -> Firehose -> S3 (Raw PII).
+
+# SSM parameter is created out-of-band.
+# It shows up twice below and must remain synced:
+#
+#   HMAC_PARAM_NAME env var -> "/vitals/hmac-key" (leading slash)
+#
+#   SSMParameterReadPolicy ParameterName -> "vitals/hmac-key" (NO leading slash,
+#   policy template will prepend "parameter/")
+#
+# tests/test_template_contract.py asserts their agreement.
+
+Resources:
+  # ----------------------------------------- Storage
+  DhdiaRawBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+            BucketKeyEnabled: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireRawAfter7Days
+            Status: Enabled
+            ExpirationInDays: 7
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  DhdiaAnalyticsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  DhdiaAthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+
+  # ------------------------------------ Ingestion
+  DhdiaVitalsStream:
+    Type: AWS::Kinesis::Stream
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      StreamModeDetails:
+        StreamMode: PROVISIONED
+      ShardCount: 1
+      RetentionPeriodHours: 24
+
+
+  # ------------------------------------ Transformation
+  DhdiaTransformFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: transform.app.handler
+      Runtime: python3.12
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          HMAC_PARAM_NAME: /vitals/hmac-key
+          ANALYTICS_BUCKET: !Ref DhdiaAnalyticsBucket
+      Policies:
+        - SSMParameterReadPolicy:
+            ParameterName: vitals/hmac-key
+        - Statement: 
+            Effect: Allow
+            Action: s3:PutObject
+            Resource:
+              - !Sub "${DhdiaAnalyticsBucket.Arn}/clean/*"
+              - !Sub "${DhdiaAnalyticsBucket.Arn}/quarantine/*"
+      Events:
+        VitalStream:
+          Type: Kinesis
+          Properties:
+            Stream: !GetAtt DhdiaVitalsStream.Arn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 1000
+            MaximumBatchingWindowInSeconds: 60
+            MaximumRetryAttempts: 3
+            BisectBatchOnFunctionError: false     # per-record errors never raise; see below
+            DestinationConfig:
+              OnFailure:
+                Type: SQS
+                Destination: !GetAtt DhdiaTransformDLQ.Arn
+
+  DhdiaTransformDLQ:
+      Type: AWS::SQS::Queue
+      DeletionPolicy: Delete
+      UpdateReplacePolicy: Delete
+      Properties:
+        SqsManagedSseEnabled: true
+        MessageRetentionPeriod: 1209600  # 14 days
+
+  DhdiaTransformLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${DhdiaTransformFunction}
+      RetentionInDays: 7
+
+
+  # ------------------------------------------------------------------------ Raw Backup
+  DhdiaFirehoseLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/kinesisfirehose/${AWS::StackName}-delivery
+      RetentionInDays: 7
+
+  DhdiaFirehoseDestinationLogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref DhdiaFirehoseLogGroup
+      LogStreamName: DestinationDelivery
+
+  DhdiaFirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: firehose-delivery
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadSourceStream
+                Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:ListShards
+                Resource: !GetAtt DhdiaVitalsStream.Arn
+              - Sid: WriteRawBucket
+                Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt DhdiaRawBucket.Arn
+                  - !Sub "${DhdiaRawBucket.Arn}/*"
+              - Sid: Logs
+                Effect: Allow
+                Action: logs:PutLogEvents
+                Resource: !Sub "${DhdiaFirehoseLogGroup.Arn}"
+
+  DhdiaRawDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt DhdiaVitalsStream.Arn
+        RoleARN: !GetAtt DhdiaFirehoseRole.Arn
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt DhdiaRawBucket.Arn
+        RoleARN: !GetAtt DhdiaFirehoseRole.Arn
+        # Quoted plain strings
+        Prefix: "raw/dt=!{timestamp:yyyy-MM-dd}/"
+        ErrorOutputPrefix: "raw-errors/!{firehose:error-output-type}/dt=!{timestamp:yyyy-MM-dd}/"
+        BufferingHints:
+          SizeInMBs: 5
+          IntervalInSeconds: 60
+        CompressionFormat: GZIP
+        CloudWatchLoggingOptions:
+            Enabled: true
+            LogGroupName: !Ref DhdiaFirehoseLogGroup
+            LogStreamName: !Ref DhdiaFirehoseDestinationLogStream
+
+
+  #  -------------------------------------- Catalog
+  DhdiaVitalsDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: vitals_db
+
+  DhdiaVitalsCleanTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref DhdiaVitalsDatabase
+      TableInput:
+        Name: vitals_clean
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: json
+          compressionType: gzip
+          projection.enabled: "true"
+          projection.dt.type: date
+          projection.dt.format: yyyy-MM-dd
+          projection.dt.range: "2026-09-01,NOW"
+          projection.dt.interval: "1"
+          projection.dt.interval.unit: DAYS
+          storage.location.template: !Sub "s3://${DhdiaAnalyticsBucket}/clean/dt=${!dt}/"  # Athena placeholder must be written ${!dt} so it renders as the literal ${dt}; a bare ${dt} fails the deploy.
+        PartitionKeys:
+          - Name: dt
+            Type: string
+        StorageDescriptor:
+          Location: !Sub "s3://${DhdiaAnalyticsBucket}/clean/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+
+          # Columns below are the only hand-maintained copy of
+          # src/core/schema.py CLEAN_COLUMNS, tests/test_template_contract.py fails if they drift.
+          Columns:
+            - {Name: event_id, Type: string}
+            - {Name: patient_key, Type: string}
+            - {Name: event_timestamp, Type: string}
+            - {Name: ingest_ts, Type: string}
+            - {Name: heart_rate, Type: int}
+            - {Name: systolic, Type: int}
+            - {Name: diastolic, Type: int}
+            - {Name: spo2, Type: double}
+            - {Name: temperature_c, Type: double}
+
+  DhdiaVitalsQuarantineTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref DhdiaVitalsDatabase
+      TableInput:
+        Name: vitals_quarantine
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: json
+          compressionType: gzip
+          projection.enabled: "true"
+          projection.dt.type: date
+          projection.dt.format: yyyy-MM-dd
+          projection.dt.range: "2026-09-01,NOW"
+          projection.dt.interval: "1"
+          projection.dt.interval.unit: DAYS
+          storage.location.template: !Sub "s3://${DhdiaAnalyticsBucket}/quarantine/dt=${!dt}/"  # Athena placeholder must be written ${!dt} so it renders as the literal ${dt}; a bare ${dt} fails the deploy.
+        PartitionKeys:
+          - Name: dt
+            Type: string
+        StorageDescriptor:
+          Location: !Sub "s3://${DhdiaAnalyticsBucket}/quarantine/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+          # Columns below are the only hand-maintained copy of
+          # src/core/schema.py QUARANTINE_COLUMNS, tests/test_template_contract.py fails if they drift.
+          Columns:
+            - {Name: event_id, Type: string}
+            - {Name: reason, Type: string}
+            - {Name: payload, Type: string}
+
+
+  # ------------------------------------ Querying
+  DhdiaAthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: vitals-wg
+      State: ENABLED
+      RecursiveDeleteOption: true      # lets `sam delete` remove it if saved queries exist
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: false
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${DhdiaAthenaResultsBucket}/results/"
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+
+
+  # ------------------------------------ Alarm
+  DhdiaTransformErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-transform-errors
+      AlarmDescription: Transform batch failed (SSM, S3, or bucket config); batch retried, then sent to the DLQ.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DhdiaTransformFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  StreamName:
+    Description: Pass to generator.py --mode kinesis
+    Value: !Ref DhdiaVitalsStream
+  RawBucketName:
+    Value: !Ref DhdiaRawBucket
+  AnalyticsBucketName:
+    Value: !Ref DhdiaAnalyticsBucket
+  AthenaResultsBucketName:
+    Value: !Ref DhdiaAthenaResultsBucket
+  TransformDLQUrl:
+    Description: Transform batch failed (SSM, S3, or bucket config); batch retried, then sent to the DLQ. 
+    Value: !Ref DhdiaTransformDLQ

@@ -10,6 +10,7 @@ import base64
 import csv
 import json
 import uuid
+import gzip
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -21,6 +22,9 @@ from transform import app
                  # YYYY MM  DD  HH  MM
 ARRIVAL = datetime(2026, 9, 15, 18, 30, tzinfo=timezone.utc)
 TEST_KEY = b"testing-key"
+TEST_BUCKET = "testing-bucket"
+SHARD_ID = "shardId-000000000000"
+FIRST_SEQUENCE = 20_500_000_000_000_000_000
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # Sentinel for raw_event(field=DELETE) --> drop the field.
@@ -33,10 +37,35 @@ def midpoint(spec) -> float | int:
     return round(value) if spec.is_integer else round(value, 1)
 
 
+class FakeS3:
+    """
+    Captures put_object calls in insertion order.
+    """
+ 
+    def __init__(self):
+        self.objects: dict[str, bytes] = {}
+        self.buckets: set[str] = set()
+ 
+    def put_object(self, *, Bucket: str, Key: str, Body: bytes, **_):
+        self.buckets.add(Bucket)
+        self.objects[Key] = Body
+ 
+    def lines(self, key: str) -> list[str]:
+        return gzip.decompress(self.objects[key]).decode().splitlines(keepends=True)
+
+
 @pytest.fixture(autouse=True)
 def hmac_key(monkeypatch) -> bytes:
     monkeypatch.setattr(app, "_hmac_key", TEST_KEY)
     return TEST_KEY
+
+
+@pytest.fixture(autouse=True)
+def fake_s3(monkeypatch) -> FakeS3:
+    fake = FakeS3()
+    monkeypatch.setattr(app, "_s3_client", fake)
+    monkeypatch.setattr(app, "ANALYTICS_BUCKET", TEST_BUCKET)
+    return fake
 
 
 @pytest.fixture
@@ -61,35 +90,64 @@ def raw_event():
 
 
 @pytest.fixture
-def firehose_event():
+def kinesis_event():
     """
-    Wrap records as Firehose input.
+    Wrap records as a Kinesis event-source-mapping batch.
     """
-
+ 
     def build(records, arrival: datetime = ARRIVAL) -> dict:
-        ms = int(arrival.timestamp() * 1000)
         wrapped = []
-
+ 
         for i, record in enumerate(records):
             data = record if isinstance(record, bytes) else json.dumps(record).encode()
-
+            sequence = str(FIRST_SEQUENCE + i)
+ 
             wrapped.append({
-                "recordId": f"rec-{i}",
-                "data": base64.b64encode(data).decode(),
-                "kinesisRecordMetadata": {"approximateArrivalTimestamp": ms},
+                "eventSource": "aws:kinesis",
+                "eventID": f"{SHARD_ID}:{sequence}",
+                "kinesis": {
+                    "partitionKey": "pk",
+                    "sequenceNumber": sequence,
+                    "data": base64.b64encode(data).decode(),
+                    "approximateArrivalTimestamp": arrival.timestamp(),  # seconds
+                },
             })
-
-        return {"invocationId": "test-invocation", "records": wrapped}
-
+ 
+        return {"Records": wrapped}
+ 
     return build
 
 
 @pytest.fixture
-def decode():
-    def _decode(result_record: dict) -> dict:
-        return json.loads(base64.b64decode(result_record["data"]))
-
-    return _decode
+def run_handler(kinesis_event, fake_s3):
+    """
+    Run the handler on records; return one output per written line, in order:
+    {"key", "zone", "dt", "row", "line"}.
+    """
+ 
+    def run(records, **kwargs) -> list[dict]:
+        before = set(fake_s3.objects)
+        app.handler(kinesis_event(records, **kwargs))
+        outputs = []
+ 
+        for key in fake_s3.objects:
+            if key in before:
+                continue
+ 
+            zone, dt_part, _name = key.split("/", 2)
+ 
+            for line in fake_s3.lines(key):
+                outputs.append({
+                    "key": key,
+                    "zone": zone,
+                    "dt": dt_part.removeprefix("dt="),
+                    "row": json.loads(line),
+                    "line": line,
+                })
+ 
+        return outputs
+ 
+    return run
 
 
 @pytest.fixture

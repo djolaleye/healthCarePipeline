@@ -19,7 +19,8 @@ import hmac
 import json
 import logging
 import os
-from collections import Counter
+import gzip
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
 from core.schema import (
@@ -41,7 +42,9 @@ HMAC_PARAM_NAME = os.environ.get("HMAC_PARAM_NAME", "/vitals/hmac-key")
 _hmac_key: bytes | None = None  # Cached for the life of the container
 
 _CLEAN_FIELDS = tuple(name for name, _ in CLEAN_COLUMNS)
+ANALYTICS_BUCKET = os.environ.get("ANALYTICS_BUCKET", "")
 
+_s3_client = None
 
 def _load_hmac_key() -> bytes:
     global _hmac_key
@@ -54,6 +57,17 @@ def _load_hmac_key() -> bytes:
         _hmac_key = response["Parameter"]["Value"].encode()
     
     return _hmac_key
+
+
+def _load_s3_client():
+    global _s3_client
+
+    if _s3_client is None:
+        import boto3
+
+        _s3_client = boto3.client("s3")
+
+    return _s3_client
 
 
 def patient_key(patient_id: str, key: bytes) -> str:
@@ -140,13 +154,8 @@ def build_quarantine(record: dict | None, reason: QuarantineReason, key: bytes) 
     }
 
 
-def _ingest_time(record: dict) -> datetime:
-    ms = record.get("kinesisRecordMetadata", {}).get("approximateArrivalTimestamp") or record.get("approximateArrivalTimestamp")
-
-    if ms is None:
-        return datetime.now(timezone.utc)
-    
-    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+def _ingest_time(kinesis: dict) -> datetime:
+    return datetime.fromtimestamp(kinesis["approximateArrivalTimestamp"], tz=timezone.utc)
 
 
 def _partition_date(record: dict | None, arrival: datetime) -> str:
@@ -162,17 +171,15 @@ def _partition_date(record: dict | None, arrival: datetime) -> str:
     return arrival.strftime(DT_FORMAT)
 
 
-def _process(record: dict, key: bytes) -> tuple[dict, str]:
+def _process(kinesis: dict, key: bytes) -> tuple[str, str, str]:
     """
-    data processing per record
-        INPUT: Base64 data --> Bytes --> JSON --> Python dict
-        OUTPUT: Python dict --> JSON --> Bytes --> Base64 data
+    data processing of one Kinesis record
     """
-    arrival = _ingest_time(record)
+    arrival = _ingest_time(kinesis)
 
     # Parse & Validate
     try:
-        parsed = json.loads(base64.b64decode(record["data"]))
+        parsed = json.loads(base64.b64decode(kinesis["data"]))
         if not isinstance(parsed, dict):
             raise ValueError("record is not a JSON object")
     except (ValueError, binascii.Error):
@@ -186,39 +193,67 @@ def _process(record: dict, key: bytes) -> tuple[dict, str]:
     else:
         zone, output = ZONE_QUARANTINE, build_quarantine(parsed, reason, key)
 
-    data = base64.b64encode((json.dumps(output) + "\n").encode()).decode()
+    data = json.dumps(output) + "\n"
 
-    response = {
-        "recordId": record["recordId"],
-        "result": "Ok",
-        "data": data,
-        "metadata": {
-            "partitionKeys": {
-                "zone": zone,
-                "dt": _partition_date(parsed, arrival)
-                }
-            },
-    }, zone
+    response = zone, _partition_date(parsed, arrival), data
 
     return response
 
 
-def handler(event: dict, context=None) -> dict:
+def _process_safe(kinesis: dict, key: bytes) -> tuple[str, str, str]:
+    """
+    Never raises. An unexpected per-record failure is quarantined with no
+    payload, so no raw data can be written to the analytics bucket.
+    """
+    try:
+        return _process(kinesis, key)
+    except Exception as exc:
+        logger.error("record failed: %s", type(exc).__name__)
+ 
+        try:
+            arrival = _ingest_time(kinesis)
+        except Exception:
+            arrival = datetime.now(timezone.utc)
+ 
+        output = build_quarantine(None, QuarantineReason.PROCESSING_ERROR, key)
+        data = json.dumps(output) + "\n"
+ 
+        return ZONE_QUARANTINE, arrival.strftime(DT_FORMAT), data
+
+
+def object_key(zone: str, dt: str, shard_id: str, first_sequence: str) -> str:
+    """
+    Deterministic per batch. Allows a retried batch to overwrite rather than duplicate.
+    """
+    return f"{zone}/dt={dt}/{shard_id}-{first_sequence}.json.gz"
+
+def handler(event: dict, context=None) -> None:
+    if not ANALYTICS_BUCKET:
+        raise RuntimeError("ANALYTICS_BUCKET is not set")
+ 
+    records = event["Records"]
+ 
+    if not records:
+        return
+    
     key = _load_hmac_key()
     counts: Counter[str] = Counter()
-    records = []
+    groups: dict[tuple[str, str], list[str]] = defaultdict(list)
 
-    for record in event["records"]:
-        try:
-            output, zone = _process(record, key)
-            counts[zone] += 1
-        except Exception:
-            # Data quality problem. Send record to Firehose 'errors/' prefix.
-            logger.exception("record %s failed", record.get("recordId"))
-            output = { "recordId": record["recordId"], "result": "ProcessingFailed" }
-            counts["failed"] += 1
-        
-        records.append(output)
 
-    logger.info(json.dumps({"processed": len(records), **counts}))
-    return {"records": records}
+    for record in records:
+        zone, dt, data = _process_safe(record["kinesis"], key)
+        groups[(zone, dt)].append(data)
+        counts[zone] += 1
+
+    shard_id = records[0]["eventID"].split(":", 1)[0]
+    first_sequence = records[0]["kinesis"]["sequenceNumber"]
+
+    for (zone, dt), data_lines in groups.items():
+        _load_s3_client().put_object(
+            Bucket=ANALYTICS_BUCKET,
+            Key=object_key(zone, dt, shard_id, first_sequence),
+            Body=gzip.compress("".join(data_lines).encode()),
+        )
+
+    logger.info(json.dumps({"processed": len(records), "objects":len(groups), **counts}))

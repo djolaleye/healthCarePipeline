@@ -76,6 +76,7 @@ class QuarantineReason(StrEnum):
     INVALID_TYPE = "invalid_type"
     INVALID_TIMESTAMP = "invalid_timestamp"
     OUT_OF_RANGE = "out_of_range"
+    PROCESSING_ERROR = "processing_error"
  
 
 ## Where each injected error should land. Used to verify results in Athena.

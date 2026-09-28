@@ -2,3 +2,5 @@ synthea/
 __pycache__
 data/
 .pytest_cache
+.venv
+.aws-sam
