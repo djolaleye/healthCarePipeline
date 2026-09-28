@@ -223,7 +223,7 @@ Full run: seed 20, 100 patients, 10,000 distinct events, 10,194 records sent.
 | DLQ `ApproximateNumberOfMessages` | 0 | ✓ 0 |
 | `errors/` prefix in analytics bucket | absent | ✓ absent |
 
-![Athena dedup query result: SELECT * FROM vitals_dedup LIMIT 5](docs/img/athena-dedup-view.png)
+![Athena dedup query result: SELECT * FROM vitals_dedup LIMIT 5](docs/img/AthenaDedupView.png)
 
 
 ---
