@@ -167,3 +167,9 @@ def test_handler_path_exists(transform):
     module, _func = props["Handler"].rsplit(".", 1)
     src = TEMPLATE.parent / props["CodeUri"]
     assert (src / (module.replace(".", "/") + ".py")).is_file()
+
+def test_dedup_view_selects_every_clean_column():
+    sql = (TEMPLATE.parent / "sql" / "vitals_dedup.sql").read_text()
+    select = sql.split("SELECT", 1)[1].split("FROM", 1)[0]
+    columns = [c.strip() for c in select.split(",")]
+    assert columns == [name for name, _ in schema.CLEAN_COLUMNS] + ["dt"]
