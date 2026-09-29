@@ -11,16 +11,12 @@ A streaming data pipeline on AWS that ingests synthetic patient vital signs, val
 
 - [Architecture](#architecture)
 - [Design decisions](#design-decisions)
-- [Data contract](#data-contract)
 - [Data quality rules](#data-quality-rules)
-- [Pseudonymization statement](#pseudonymization-statement)
+- [Pseudonymization statement](#theoretical-hipaa-compliance)
 - [Sample input and output](#sample-input-and-output)
 - [Verification results](#verification-results)
-- [Repository layout](#repository-layout)
-- [Running it](#running-it)
-- [Cost notes](#cost-notes)
-- [Limitations and next steps](#limitations-and-next-steps)
-- [Teardown](#teardown)
+- [Running](#running)
+- [Future Additions](#future-additions)
 
 ---
 
